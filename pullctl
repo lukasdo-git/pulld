@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+pullctl — CLI management tool for pulld
+
+Usage:
+  pullctl add <name> --path <repo_path> [--branch <branch>] [--timeout <sec>]
+  pullctl remove <name> [--keep-script] [--keep-logs]
+  pullctl list
+  pullctl logs <name> [-n <lines>] [-f]
+  pullctl status
+  pullctl secret <name> [--regenerate]
+  pullctl config [--port <port>] [--host <host>]
+"""
+
+import sys
+import os
+import json
+import secrets
+import subprocess
+import shutil
+import argparse
+import socket
+from pathlib import Path
+
+VERSION      = "1.0.0"
+CONFIG_PATH  = "/etc/pulld/config.json"
+LOG_DIR      = "/var/log/pulld"
+DEPLOY_DIR   = "/etc/pulld/deploy"
+TEMPLATES_DIR = "/usr/share/pulld/templates"
+LOCK_DIR     = "/run/pulld"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Terminal colors (no external deps)
+# ──────────────────────────────────────────────────────────────────
+
+def _supports_color() -> bool:
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+class C:
+    """ANSI escape codes, disabled when stdout is not a TTY."""
+    _on = _supports_color()
+    RESET  = "\033[0m"     if _on else ""
+    BOLD   = "\033[1m"     if _on else ""
+    DIM    = "\033[2m"     if _on else ""
+    RED    = "\033[91m"    if _on else ""
+    GREEN  = "\033[92m"    if _on else ""
+    YELLOW = "\033[93m"    if _on else ""
+    BLUE   = "\033[94m"    if _on else ""
+    CYAN   = "\033[96m"    if _on else ""
+
+
+# ──────────────────────────────────────────────────────────────────
+# Output helpers
+# ──────────────────────────────────────────────────────────────────
+
+def ok(msg: str):   print(f"{C.GREEN}✓{C.RESET}  {msg}")
+def fail(msg: str): print(f"{C.RED}✗{C.RESET}  {msg}", file=sys.stderr)
+def warn(msg: str): print(f"{C.YELLOW}!{C.RESET}  {msg}")
+def info(msg: str): print(f"{C.BLUE}→{C.RESET}  {msg}")
+
+def header(title: str):
+    bar = "━" * 60
+    print(f"\n{C.BOLD}{C.CYAN}{bar}{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}  {title}{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}{bar}{C.RESET}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Guards
+# ──────────────────────────────────────────────────────────────────
+
+def require_root():
+    if os.geteuid() != 0:
+        fail("This command requires root. Try: sudo pullctl ...")
+        sys.exit(1)
+
+
+def require_project(config: dict, name: str):
+    if name not in config or name.startswith("_"):
+        fail(f"Project '{name}' not found. Run 'pullctl list' to see registered projects.")
+        sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Config I/O
+# ──────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        fail(f"Could not read config ({CONFIG_PATH}): {e}")
+        sys.exit(1)
+
+
+def save_config(config: dict):
+    """Write config atomically to prevent partial writes."""
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)  # atomic rename
+    os.chmod(CONFIG_PATH, 0o600)  # root-readable only (contains secrets)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Service management
+# ──────────────────────────────────────────────────────────────────
+
+def reload_service():
+    """Restart the daemon so it picks up config changes."""
+    result = subprocess.run(
+        ["systemctl", "reload-or-restart", "pulld"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        ok("Service reloaded")
+    else:
+        warn("Could not reload service automatically — run: sudo systemctl restart pulld")
+
+
+def service_is_active() -> bool:
+    r = subprocess.run(["systemctl", "is-active", "--quiet", "pulld"])
+    return r.returncode == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Project detection & templating
+# ──────────────────────────────────────────────────────────────────
+
+_PROJECT_INDICATORS = [
+    # (filename, type_label)
+    ("docker-compose.yml",  "docker"),
+    ("docker-compose.yaml", "docker"),
+    ("package.json",        "node"),
+    ("requirements.txt",    "python"),
+    ("pyproject.toml",      "python"),
+    ("Cargo.toml",          "rust"),
+]
+
+def detect_project_type(repo_path: str) -> str:
+    p = Path(repo_path)
+    for filename, project_type in _PROJECT_INDICATORS:
+        if (p / filename).exists():
+            return project_type
+    return "generic"
+
+
+def generate_deploy_script(project: str, project_type: str) -> str:
+    """
+    Copy the appropriate template to /etc/pulld/deploy/<project>.sh.
+    Falls back to an inline generic template if templates aren't installed.
+    Returns the path to the generated script.
+    """
+    os.makedirs(DEPLOY_DIR, exist_ok=True)
+    dest = os.path.join(DEPLOY_DIR, f"{project}.sh")
+
+    template_src = os.path.join(TEMPLATES_DIR, f"{project_type}.sh")
+
+    if os.path.isfile(template_src):
+        shutil.copy(template_src, dest)
+    else:
+        # Inline fallback — always works even if templates dir is missing
+        with open(dest, "w") as f:
+            f.write(f"""#!/bin/bash
+# Deploy script for: {project}
+# Auto-generated by pullctl — edit this file to suit your stack.
+#
+# This script runs as the pulld service user from inside the repo directory.
+# stdout and stderr are captured to /var/log/pulld/{project}.log
+set -euo pipefail
+
+echo "── Pulling latest changes ──────────────────────"
+git pull
+
+# ── Add your build and restart commands below ──────
+#
+# Node.js examples:
+#   npm ci --silent
+#   npm run build
+#   pm2 restart {project}
+#   systemctl restart {project}
+#
+# Docker example:
+#   docker compose up --build -d
+#
+# Python example:
+#   pip install -r requirements.txt -q
+#   systemctl restart {project}
+
+echo "── Deploy complete ─────────────────────────────"
+""")
+
+    os.chmod(dest, 0o750)
+    return dest
+
+
+# ──────────────────────────────────────────────────────────────────
+# GitHub instructions printer
+# ──────────────────────────────────────────────────────────────────
+
+def _get_server_ip() -> str:
+    try:
+        # Connect to an external address to discover the outbound IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "YOUR_SERVER_IP"
+
+
+def print_github_instructions(project: str, secret: str, port: int):
+    ip = _get_server_ip()
+
+    print(f"""
+{C.BOLD}{C.CYAN}{'━' * 64}{C.RESET}
+{C.BOLD}  GitHub Webhook Setup — {project}{C.RESET}
+{C.CYAN}{'━' * 64}{C.RESET}
+
+  1. Open your GitHub repo → {C.BOLD}Settings → Webhooks → Add webhook{C.RESET}
+
+  2. Fill in the form:
+
+     {C.BOLD}Payload URL{C.RESET}     http://{ip}:{port}/webhook/{project}
+     {C.BOLD}Content type{C.RESET}    application/json
+     {C.BOLD}Secret{C.RESET}          {C.YELLOW}{secret}{C.RESET}
+     {C.BOLD}SSL verification{C.RESET} Disable if using plain HTTP
+     {C.BOLD}Events{C.RESET}          ✓ Just the push event
+
+  3. Click {C.BOLD}Add webhook{C.RESET}.
+     GitHub will send a ping — you should see it confirmed immediately.
+
+  {C.DIM}Next: edit your deploy script at:{C.RESET}
+  {C.DIM}  {DEPLOY_DIR}/{project}.sh{C.RESET}
+
+{C.CYAN}{'━' * 64}{C.RESET}
+""")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Commands
+# ──────────────────────────────────────────────────────────────────
+
+def cmd_add(args):
+    require_root()
+
+    project  = args.name
+    repo_path = os.path.realpath(args.path)
+    branch   = args.branch
+    timeout  = args.timeout
+
+    # Validate repo path
+    if not os.path.isdir(repo_path):
+        fail(f"Directory not found: {repo_path}")
+        sys.exit(1)
+
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        warn(f"No .git directory found in {repo_path} — is this a cloned repo?")
+
+    config = load_config()
+    port   = int(config.get("_port", 9000))
+
+    if project in config:
+        fail(f"Project '{project}' is already registered.")
+        info(f"To replace it: pullctl remove {project} && pullctl add {project} ...")
+        sys.exit(1)
+
+    # Validate project name (used in URL path)
+    if not project.replace("-", "").replace("_", "").isalnum():
+        fail("Project name may only contain letters, numbers, hyphens, and underscores.")
+        sys.exit(1)
+
+    # Detect stack and generate deploy script
+    project_type = detect_project_type(repo_path)
+    info(f"Detected project type: {C.BOLD}{project_type}{C.RESET}")
+
+    deploy_script = generate_deploy_script(project, project_type)
+    ok(f"Deploy script created: {deploy_script}")
+
+    # Generate a cryptographically secure random secret
+    secret = secrets.token_hex(32)
+
+    # Update config
+    config[project] = {
+        "secret":        secret,
+        "repo_path":     repo_path,
+        "deploy_script": deploy_script,
+        "branch":        branch,
+        "timeout":       timeout,
+    }
+    save_config(config)
+    ok(f"Project '{project}' registered")
+
+    # Reload daemon
+    reload_service()
+
+    # Print GitHub setup instructions
+    print_github_instructions(project, secret, port)
+
+    info(f"Tip: run  {C.BOLD}pullctl logs {project} -f{C.RESET}  to watch live deploy output")
+
+
+def cmd_remove(args):
+    require_root()
+
+    project = args.name
+    config  = load_config()
+    require_project(config, project)
+
+    deploy_script = config[project].get("deploy_script", "")
+    log_path      = os.path.join(LOG_DIR, f"{project}.log")
+
+    del config[project]
+    save_config(config)
+    ok(f"Project '{project}' removed from config")
+
+    if deploy_script and os.path.exists(deploy_script) and not args.keep_script:
+        os.remove(deploy_script)
+        ok(f"Deploy script deleted: {deploy_script}")
+
+    if os.path.exists(log_path) and not args.keep_logs:
+        os.remove(log_path)
+        ok(f"Deploy log deleted: {log_path}")
+
+    reload_service()
+
+
+def cmd_list(args):
+    config   = load_config()
+    projects = {k: v for k, v in config.items() if not k.startswith("_")}
+    port     = config.get("_port", 9000)
+
+    if not projects:
+        warn("No projects registered. Add one with: pullctl add <name> --path <repo>")
+        return
+
+    header(f"Registered Projects  ({len(projects)})")
+
+    for name, cfg in sorted(projects.items()):
+        # Deployment status via lock file
+        lock    = os.path.join(LOCK_DIR, f"{name}.lock")
+        deploying = os.path.exists(lock)
+        status  = (f"{C.YELLOW}● deploying…{C.RESET}" if deploying
+                   else f"{C.GREEN}● idle{C.RESET}")
+
+        # Last deploy time from log file mtime
+        log_path = os.path.join(LOG_DIR, f"{name}.log")
+        if os.path.exists(log_path):
+            import datetime
+            mtime    = os.path.getmtime(log_path)
+            last     = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            last_str = f"{C.DIM}last deploy: {last}{C.RESET}"
+        else:
+            last_str = f"{C.DIM}no deploys yet{C.RESET}"
+
+        print(f"\n  {C.BOLD}{name}{C.RESET}  {status}  {last_str}")
+        print(f"    {C.DIM}path   {C.RESET}  {cfg.get('repo_path', '—')}")
+        print(f"    {C.DIM}branch {C.RESET}  {cfg.get('branch', 'main')}")
+        print(f"    {C.DIM}script {C.RESET}  {cfg.get('deploy_script', '—')}")
+        print(f"    {C.DIM}url    {C.RESET}  http://<host>:{port}/webhook/{name}")
+
+    print()
+
+    # Show daemon status
+    active = service_is_active()
+    daemon = f"{C.GREEN}running{C.RESET}" if active else f"{C.RED}stopped{C.RESET}"
+    print(f"  pulld daemon: {daemon}\n")
+
+
+def cmd_logs(args):
+    config = load_config()
+    require_project(config, args.name)
+
+    log_path = os.path.join(LOG_DIR, f"{args.name}.log")
+
+    if not os.path.exists(log_path):
+        warn(f"No deploy logs yet for '{args.name}'")
+        info(f"Logs will appear here after the first push to the watched branch.")
+        return
+
+    # Replace the current process with tail — cleaner than subprocess
+    cmd = ["tail", "-n", str(args.lines)]
+    if args.follow:
+        cmd.append("-f")
+    cmd.append(log_path)
+    os.execlp("tail", *cmd)
+
+
+def cmd_status(args):
+    os.execlp("systemctl", "systemctl", "status", "pulld")
+
+
+def cmd_secret(args):
+    require_root()
+
+    config = load_config()
+    require_project(config, args.name)
+
+    port = int(config.get("_port", 9000))
+
+    if args.regenerate:
+        new_secret = secrets.token_hex(32)
+        config[args.name]["secret"] = new_secret
+        save_config(config)
+        ok(f"New secret generated for '{args.name}'")
+        reload_service()
+        warn("Update the secret in your GitHub webhook settings, then push a commit to verify.")
+        secret = new_secret
+    else:
+        secret = config[args.name]["secret"]
+
+    print_github_instructions(args.name, secret, port)
+
+
+def cmd_config(args):
+    require_root()
+
+    config = load_config()
+    changed = False
+
+    if args.port:
+        config["_port"] = args.port
+        ok(f"Port set to {args.port}")
+        changed = True
+
+    if args.host:
+        config["_host"] = args.host
+        ok(f"Host set to {args.host}")
+        changed = True
+
+    if changed:
+        save_config(config)
+        reload_service()
+    else:
+        # Print current global settings
+        header("Global Configuration")
+        print(f"\n  {C.DIM}host{C.RESET}    {config.get('_host', '0.0.0.0')}")
+        print(f"  {C.DIM}port{C.RESET}    {config.get('_port', 9000)}")
+        print(f"  {C.DIM}config{C.RESET}  {CONFIG_PATH}\n")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Argument parser
+# ──────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pullctl",
+        description=f"{C.BOLD}pullctl v{VERSION}{C.RESET} — manage pulld deployments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run 'pullctl <command> --help' for per-command options.",
+    )
+    parser.add_argument("--version", action="version", version=f"pullctl {VERSION}")
+
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    # ── add ──────────────────────────────────────────────────────
+    p = sub.add_parser("add", help="Register a new project for auto-deployment")
+    p.add_argument("name",     help="Project identifier (used in the webhook URL)")
+    p.add_argument("--path",   required=True, metavar="DIR",
+                   help="Absolute path to the cloned git repo on this server")
+    p.add_argument("--branch", default="main", metavar="BRANCH",
+                   help="Branch to watch (default: main)")
+    p.add_argument("--timeout", type=int, default=300, metavar="SEC",
+                   help="Max seconds to allow the deploy script to run (default: 300)")
+
+    # ── remove ───────────────────────────────────────────────────
+    p = sub.add_parser("remove", help="Unregister a project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("--keep-script", action="store_true",
+                   help="Do not delete the deploy script")
+    p.add_argument("--keep-logs", action="store_true",
+                   help="Do not delete the deploy log")
+
+    # ── list ─────────────────────────────────────────────────────
+    sub.add_parser("list", help="List all registered projects and their status")
+
+    # ── logs ─────────────────────────────────────────────────────
+    p = sub.add_parser("logs", help="View deploy logs for a project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("-n", "--lines", type=int, default=50, metavar="N",
+                   help="Number of lines to display (default: 50)")
+    p.add_argument("-f", "--follow", action="store_true",
+                   help="Follow log output in real time (Ctrl+C to stop)")
+
+    # ── status ───────────────────────────────────────────────────
+    sub.add_parser("status", help="Show pulld systemd service status")
+
+    # ── secret ───────────────────────────────────────────────────
+    p = sub.add_parser("secret", help="Show or regenerate the webhook secret for a project")
+    p.add_argument("name", help="Project name")
+    p.add_argument("--regenerate", action="store_true",
+                   help="Generate a new secret (requires updating GitHub webhook settings)")
+
+    # ── config ───────────────────────────────────────────────────
+    p = sub.add_parser("config", help="View or update global daemon settings")
+    p.add_argument("--port", type=int, metavar="PORT",
+                   help="Port for the webhook listener (default: 9000)")
+    p.add_argument("--host", metavar="HOST",
+                   help="Host to bind to (default: 0.0.0.0)")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    dispatch = {
+        "add":     cmd_add,
+        "remove":  cmd_remove,
+        "list":    cmd_list,
+        "logs":    cmd_logs,
+        "status":  cmd_status,
+        "secret":  cmd_secret,
+        "config":  cmd_config,
+    }
+
+    if args.command not in dispatch:
+        parser.print_help()
+        sys.exit(0)
+
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

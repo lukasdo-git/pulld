@@ -1,0 +1,32 @@
+[Unit]
+Description=pulld — GitHub Webhook Deployment Daemon
+Documentation=https://github.com/yourname/pulld
+# Wait for full network stack before starting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pulld
+
+# Restart automatically on crash, with a 5-second cooldown
+Restart=on-failure
+RestartSec=5s
+
+# Forward stdout/stderr into journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pulld
+
+# ── Security hardening ──────────────────────────────────────────
+# These restrict what the process can access on the system.
+# Remove or adjust if your deploy scripts need broader access.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Allow writes only to the directories pulld actually needs
+ReadWritePaths=/var/log/pulld /run/pulld /etc/pulld
+
+[Install]
+WantedBy=multi-user.target
