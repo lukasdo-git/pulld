@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 import signal
+import socket
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -312,6 +313,46 @@ class WebhookHandler(BaseHTTPRequestHandler):
 # Entry point
 # ──────────────────────────────────────────────────────────────────
 
+def _check_port(host: str, port: int) -> None:
+    """
+    Try binding a throwaway socket to the target port before starting the
+    real server. If the bind fails the port is already in use — log a clear
+    human-readable message and exit so systemd surfaces it via journalctl.
+    """
+    import errno
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((host, port))
+    except OSError as e:
+        if e.errno in (errno.EADDRINUSE, errno.EACCES):
+            # Try to identify what process owns the port (Linux-only, best-effort)
+            owner = ""
+            try:
+                out = subprocess.check_output(
+                    ["ss", "-tlnp", f"sport = :{port}"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                for line in out.splitlines():
+                    if str(port) in line and "users:" in line:
+                        # ss output looks like: users:(("nginx",pid=1234,fd=6))
+                        owner = line.split("users:")[-1].strip()
+                        break
+            except Exception:
+                pass
+
+            hint = f" (in use by {owner})" if owner else ""
+            log.error(
+                f"Port {port} is already in use{hint}. "
+                f"Choose a different port with: pullctl config --port <PORT>"
+            )
+            sys.exit(1)
+        raise
+    finally:
+        probe.close()
+
+
 def main() -> None:
     os.makedirs(LOG_DIR,  exist_ok=True)
     os.makedirs(LOCK_DIR, exist_ok=True)
@@ -321,6 +362,8 @@ def main() -> None:
     port   = int(config.get("_port", 9000))
 
     log.info(f"pulld v{VERSION} starting")
+
+    _check_port(host, port)
 
     server = ThreadingHTTPServer((host, port), WebhookHandler)
 
