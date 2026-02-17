@@ -42,7 +42,7 @@ That's it.
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/pulld.git
+git clone https://github.com/lukasdo-git/pulld.git
 cd pulld
 sudo bash install.sh
 ```
