@@ -21,6 +21,8 @@ import shutil
 import argparse
 import socket
 import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 VERSION      = "1.0.0"
@@ -201,6 +203,232 @@ echo "── Deploy complete ─────────────────
     return dest
 
 
+
+# ──────────────────────────────────────────────────────────────────
+# UPnP / IGD port forwarding
+# ──────────────────────────────────────────────────────────────────
+# Implements just enough of the UPnP Internet Gateway Device (IGD)
+# protocol to add a port mapping — no external libraries required.
+#
+# Flow:
+#   1. SSDP M-SEARCH multicast  →  discover gateway location URL
+#   2. HTTP GET location URL    →  parse XML to find control URL
+#   3. HTTP POST SOAP action    →  AddPortMapping
+
+_SSDP_ADDR    = "239.255.255.250"
+_SSDP_PORT    = 1900
+_SSDP_TIMEOUT = 3  # seconds to wait for gateway response
+_SSDP_TARGETS = [
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:2",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+]
+
+_SOAP_ADD_PORT_MAPPING = """<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:AddPortMapping xmlns:u="{service_type}">
+      <NewRemoteHost></NewRemoteHost>
+      <NewExternalPort>{ext_port}</NewExternalPort>
+      <NewProtocol>TCP</NewProtocol>
+      <NewInternalPort>{int_port}</NewInternalPort>
+      <NewInternalClient>{local_ip}</NewInternalClient>
+      <NewEnabled>1</NewEnabled>
+      <NewPortMappingDescription>pulld-{project}</NewPortMappingDescription>
+      <NewLeaseDuration>0</NewLeaseDuration>
+    </u:AddPortMapping>
+  </s:Body>
+</s:Envelope>"""
+
+
+def _ssdp_discover() -> list[str]:
+    """
+    Broadcast an SSDP M-SEARCH and collect unique Location URLs from responses.
+    Returns a list of location URLs (may be empty if no UPnP gateway responds).
+    """
+    locations = []
+    seen = set()
+
+    for target in _SSDP_TARGETS:
+        msg = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            f"HOST: {_SSDP_ADDR}:{_SSDP_PORT}\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 2\r\n"
+            f"ST: {target}\r\n"
+            "\r\n"
+        ).encode()
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.settimeout(_SSDP_TIMEOUT)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.sendto(msg, (_SSDP_ADDR, _SSDP_PORT))
+
+            while True:
+                try:
+                    data = sock.recv(4096).decode("utf-8", errors="ignore")
+                    for line in data.splitlines():
+                        if line.lower().startswith("location:"):
+                            loc = line.split(":", 1)[1].strip()
+                            if loc not in seen:
+                                seen.add(loc)
+                                locations.append(loc)
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    return locations
+
+
+def _parse_control_url(location_url: str) -> tuple[str, str] | None:
+    """
+    Fetch the UPnP device description XML at location_url and return
+    (control_url, service_type) for the first WAN connection service found.
+    Returns None if parsing fails or no suitable service is found.
+    """
+    try:
+        req = urllib.request.Request(location_url, headers={"User-Agent": "pulld/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            xml_data = resp.read()
+    except Exception:
+        return None
+
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError:
+        return None
+
+    # Strip XML namespaces for simpler element matching
+    for el in root.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+    # Parse the base URL from the location URL to resolve relative control URLs
+    from urllib.parse import urlparse as _urlparse, urljoin
+    base = "{u.scheme}://{u.netloc}".format(u=_urlparse(location_url))
+
+    wan_service_types = {
+        "urn:schemas-upnp-org:service:WANIPConnection:1",
+        "urn:schemas-upnp-org:service:WANIPConnection:2",
+        "urn:schemas-upnp-org:service:WANPPPConnection:1",
+    }
+
+    for service in root.iter("service"):
+        stype = (service.findtext("serviceType") or "").strip()
+        ctrl  = (service.findtext("controlURL")  or "").strip()
+        if stype in wan_service_types and ctrl:
+            control_url = ctrl if ctrl.startswith("http") else urljoin(base, ctrl)
+            return control_url, stype
+
+    return None
+
+
+def _soap_add_port_mapping(
+    control_url: str,
+    service_type: str,
+    local_ip: str,
+    port: int,
+    project: str,
+) -> tuple[bool, str]:
+    """
+    Send the SOAP AddPortMapping request to the gateway.
+    Returns (success, message).
+    """
+    body = _SOAP_ADD_PORT_MAPPING.format(
+        service_type=service_type,
+        ext_port=port,
+        int_port=port,
+        local_ip=local_ip,
+        project=project,
+    ).encode("utf-8")
+
+    soap_action = f'"{service_type}#AddPortMapping"'
+
+    req = urllib.request.Request(
+        control_url,
+        data=body,
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction":   soap_action,
+            "Content-Length": str(len(body)),
+            "User-Agent":   "pulld/1.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
+            return True, "Port mapping added successfully"
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="ignore")
+        # Extract UPnP error description from SOAP fault if present
+        try:
+            fault_root = ET.fromstring(body_text)
+            for el in fault_root.iter():
+                if "}" in el.tag:
+                    el.tag = el.tag.split("}", 1)[1]
+            desc = fault_root.findtext(".//errorDescription") or ""
+            code = fault_root.findtext(".//errorCode") or str(e.code)
+            if desc:
+                return False, f"UPnP error {code}: {desc}"
+        except ET.ParseError:
+            pass
+        return False, f"HTTP {e.code}: {e.reason}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def setup_upnp(port: int, project: str) -> bool:
+    """
+    Attempt to set up a UPnP port mapping for the given port.
+    Prints progress to the terminal.
+    Returns True if successful, False otherwise.
+    """
+    info("Attempting UPnP port forwarding setup...")
+
+    local_ip = _get_local_ip()
+    if not local_ip:
+        warn("Could not determine local IP — skipping UPnP.")
+        return False
+
+    # Step 1: SSDP discovery
+    locations = _ssdp_discover()
+    if not locations:
+        return False
+
+    ok(f"UPnP gateway discovered")
+
+    # Step 2: Parse control URL from device description
+    for location in locations:
+        result = _parse_control_url(location)
+        if result:
+            control_url, service_type = result
+            break
+    else:
+        warn("Found UPnP gateway but could not parse its service description.")
+        return False
+
+    # Step 3: Add port mapping
+    success, message = _soap_add_port_mapping(
+        control_url, service_type, local_ip, port, project
+    )
+
+    if success:
+        ok(f"UPnP: port {port} → {local_ip}:{port} (TCP) mapped on your router")
+        return True
+    else:
+        warn(f"UPnP request failed: {message}")
+        return False
+
+
 # ──────────────────────────────────────────────────────────────────
 # GitHub instructions printer
 # ──────────────────────────────────────────────────────────────────
@@ -334,6 +562,16 @@ def cmd_add(args):
     # Reload daemon
     reload_service()
 
+    # Attempt UPnP port forwarding — best effort, never fatal
+    upnp_ok = setup_upnp(port, project)
+    if not upnp_ok:
+        print()
+        warn(f"{C.BOLD}UPnP port forwarding was not set up automatically.{C.RESET}")
+        warn(f"If your server is behind a router (NAT), you need to forward")
+        warn(f"port {port} (TCP) to this machine ({_get_local_ip()}) manually.")
+        warn(f"Check your router's admin panel — usually at http://192.168.1.1")
+        print()
+
     # Print GitHub setup instructions
     print_github_instructions(project, secret, port)
 
@@ -408,17 +646,15 @@ def cmd_list(args):
 
 
 def cmd_logs(args):
-    config = load_config()
-    require_project(config, args.name)
-
+    # Intentionally does NOT read config — config is root-only (contains secrets).
+    # The log path is deterministic, and /var/log/pulld/ is world-readable.
     log_path = os.path.join(LOG_DIR, f"{args.name}.log")
 
     if not os.path.exists(log_path):
         warn(f"No deploy logs yet for '{args.name}'")
-        info(f"Logs will appear here after the first push to the watched branch.")
+        info("Logs will appear here after the first push to the watched branch.")
         return
 
-    # Replace the current process with tail — cleaner than subprocess
     cmd = ["tail", "-n", str(args.lines)]
     if args.follow:
         cmd.append("-f")
