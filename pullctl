@@ -20,6 +20,7 @@ import subprocess
 import shutil
 import argparse
 import socket
+import urllib.request
 from pathlib import Path
 
 VERSION      = "1.0.0"
@@ -204,24 +205,58 @@ echo "── Deploy complete ─────────────────
 # GitHub instructions printer
 # ──────────────────────────────────────────────────────────────────
 
-def _get_server_ip() -> str:
+# Public IP services to try in order — all return a plain-text IP and are
+# widely used, stable, and require no authentication.
+_PUBLIC_IP_URLS = [
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+]
+
+def _get_local_ip() -> str:
     try:
-        # Connect to an external address to discover the outbound IP
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except OSError:
-        return "YOUR_SERVER_IP"
+        return ""
+
+def _get_server_ip() -> tuple[str, bool]:
+    """
+    Returns (ip_address, is_public).
+    Tries several public IP services; falls back to the LAN IP with a warning.
+    """
+    for url in _PUBLIC_IP_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "pulld/1.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                ip = resp.read().decode().strip()
+                if ip and ip[0].isdigit():
+                    return ip, True
+        except Exception:
+            continue
+
+    # All public lookups failed (no internet access?) — fall back to LAN IP
+    local = _get_local_ip()
+    return (local or "YOUR_SERVER_IP"), False
 
 
 def print_github_instructions(project: str, secret: str, port: int):
-    ip = _get_server_ip()
+    ip, is_public = _get_server_ip()
+
+    ip_note = ""
+    if not is_public:
+        ip_note = (
+            f"\n  {C.YELLOW}!{C.RESET}  {C.BOLD}Could not detect your public IP.{C.RESET}\n"
+            f"  {C.DIM}  The address below is your LAN IP — replace it with your public IP\n"
+            f"     before pasting into GitHub. Find it at: https://api.ipify.org{C.RESET}\n"
+        )
 
     print(f"""
 {C.BOLD}{C.CYAN}{'━' * 64}{C.RESET}
 {C.BOLD}  GitHub Webhook Setup — {project}{C.RESET}
 {C.CYAN}{'━' * 64}{C.RESET}
-
+{ip_note}
   1. Open your GitHub repo → {C.BOLD}Settings → Webhooks → Add webhook{C.RESET}
 
   2. Fill in the form:

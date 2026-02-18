@@ -109,12 +109,43 @@ systemctl daemon-reload
 systemctl enable pulld
 systemctl restart pulld
 
-sleep 1
+# ── Wait for the daemon to actually come up ───────────────────────
+# systemctl restart returns immediately — we need to poll the /health
+# endpoint to confirm the process has bound its port and is responding.
+PORT=$(python3 -c "
+import json
+try:
+    cfg = json.load(open('/etc/pulld/config.json'))
+    print(cfg.get('_port', 9000))
+except: print(9000)
+")
 
-if systemctl is-active --quiet pulld; then
-    ok "pulld is running"
+info "Waiting for pulld to come up on port ${PORT}..."
+
+ATTEMPTS=8
+HEALTHY=0
+for i in $(seq 1 $ATTEMPTS); do
+    sleep 1
+    RESPONSE=$(curl -sf "http://127.0.0.1:${PORT}/health" 2>/dev/null || true)
+    if echo "$RESPONSE" | grep -q "pulld"; then
+        HEALTHY=1
+        break
+    fi
+done
+
+if [[ "$HEALTHY" -eq 1 ]]; then
+    ok "pulld is running and healthy"
 else
-    warn "Service may not have started. Check: journalctl -u pulld -n 20"
+    echo ""
+    echo -e "${RED}✗${RESET}  pulld did not respond after ${ATTEMPTS}s — something went wrong." >&2
+    echo ""
+    echo -e "  ${BOLD}Last log entries:${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────${RESET}"
+    journalctl -u pulld -n 15 --no-pager 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+    warn "Fix the issue above, then run: sudo systemctl restart pulld"
+    warn "To change the port:            sudo pullctl config --port <PORT>"
+    # Don't exit — files are installed correctly, only startup failed
 fi
 
 # ──────────────────────────────────────────────────────────────────
