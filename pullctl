@@ -545,6 +545,20 @@ def cmd_add(args):
     deploy_script = generate_deploy_script(project, project_type)
     ok(f"Deploy script created: {deploy_script}")
 
+    # Ensure root's git config trusts this directory.
+    # pulld runs as root via systemd, so git's safe.directory check applies
+    # to /root/.gitconfig — not the repo owner's ~/.gitconfig.
+    try:
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", repo_path],
+            check=True, capture_output=True,
+        )
+        ok(f"Git safe.directory set for {repo_path}")
+    except subprocess.CalledProcessError as e:
+        warn(f"Could not set git safe.directory: {e.stderr.decode().strip()}")
+        warn(f"If deploys fail with 'dubious ownership', run manually:")
+        warn(f"  sudo git config --global --add safe.directory {repo_path}")
+
     # Generate a cryptographically secure random secret
     secret = secrets.token_hex(32)
 
