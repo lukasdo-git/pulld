@@ -159,12 +159,20 @@ def run_deploy(project: str, cfg: dict, payload: dict) -> None:
             log_file.write(header)
             log_file.flush()
 
+            # Build a sane environment for the deploy script.
+            # systemd strips most env vars, including HOME — without it git
+            # cannot find /root/.gitconfig and safe.directory is ignored.
+            deploy_env = os.environ.copy()
+            deploy_env.setdefault("HOME", "/root")
+            deploy_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
             result = subprocess.run(
                 ["/bin/bash", deploy_script],
                 cwd=repo_path,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
+                env=deploy_env,
             )
 
             footer = (
