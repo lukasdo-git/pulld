@@ -1,6 +1,6 @@
 [Unit]
 Description=pulld — GitHub Webhook Deployment Daemon
-Documentation=https://github.com/yourname/pulld
+Documentation=https://github.com/lukasdo-git/pulld
 # Wait for full network stack before starting
 After=network-online.target
 Wants=network-online.target
