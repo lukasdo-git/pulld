@@ -21,11 +21,14 @@ pulld solves that. It runs as a systemd daemon, listens for push events from Git
 - **Branch filtering** — only deploys on pushes to the watched branch (e.g. `main`)
 - **Concurrent-safe** — per-project lock files prevent overlapping deploys if two pushes arrive in quick succession
 - **Structured logging** — timestamped deploy logs per project at `/var/log/pulld/<project>.log`
-- **Auto-detects stack** — generates a tailored starter deploy script for Node.js, Python, Docker, or Rust
-- **CLI management** — `pullctl` covers the full lifecycle: add, remove, list, logs, secrets
+- **Auto-detects stack** — generates a tailored starter deploy script for Node.js, Python, Docker, Rust, or a generic fallback
+- **SSH deploy key setup** — automatically generates an ed25519 key, configures `known_hosts` and SSH config for private repos
+- **UPnP port forwarding** — attempts automatic router port mapping via UPnP/IGD so you don't have to configure NAT manually
+- **Public IP detection** — resolves your server's public IP to generate copy-paste-ready GitHub webhook URLs
+- **CLI management** — `pullctl` covers the full lifecycle: add, remove, list, logs, secrets, config
 - **Config hot-reload** — edits to the config take effect on the next request, no restart required
-- **Systemd integration** — health-checked, auto-restarting, logs to `journald`
-- **GitHub ping support** — correctly handles the ping GitHub sends when a webhook is first configured
+- **Systemd integration** — health-checked, auto-restarting, security-hardened, logs to `journald`
+- **Port conflict detection** — on startup, identifies the process occupying the port and exits with a clear message
 
 ---
 
@@ -34,8 +37,6 @@ pulld solves that. It runs as a systemd daemon, listens for push events from Git
 - Linux with systemd
 - Python 3.7+
 - Git
-
-That's it.
 
 ---
 
@@ -48,13 +49,18 @@ sudo bash install.sh
 ```
 
 The installer:
-1. Copies `pulld` and `pullctl` to `/usr/local/bin/`
-2. Installs the systemd service and enables it on boot
-3. Creates an initial config at `/etc/pulld/config.json`
-4. Optionally opens port 9000 through ufw if it's active
-5. Starts the daemon immediately
+
+1. Verifies prerequisites (root, Python 3.7+, Git)
+2. Creates all required directories
+3. Copies `pulld` and `pullctl` to `/usr/local/bin/`
+4. Installs deploy script templates to `/usr/share/pulld/templates/`
+5. Installs and enables the systemd service
+6. Creates an initial config at `/etc/pulld/config.json`
+7. Optionally opens port 9000 through ufw if it's active
+8. Starts the daemon and polls `/health` to confirm it's up
 
 Verify it's running:
+
 ```bash
 curl http://localhost:9000/health
 # → {"status": 200, "message": "pulld v1.0.0 — 0 project(s) registered"}
@@ -62,24 +68,31 @@ curl http://localhost:9000/health
 
 ---
 
-## Registering a project
+## Quick start
+
+### Register a project
 
 ```bash
 sudo pullctl add my-app --path /srv/my-app --branch main
 ```
 
-That command:
-- Detects your stack (Node, Python, Docker, etc.) and generates a starter deploy script at `/etc/pulld/deploy/my-app.sh`
-- Generates a random webhook secret
-- Registers the project in the config
-- Prints the exact URL and secret to paste into GitHub
+This single command:
+
+- Detects your stack (Node, Python, Docker, Rust) and writes a starter deploy script to `/etc/pulld/deploy/my-app.sh`
+- Generates a cryptographically secure webhook secret
+- Sets `git safe.directory` so the daemon can pull from the repo
+- If the remote is SSH, generates an ed25519 deploy key and prints instructions to add it on GitHub
+- Attempts UPnP port forwarding on your router (best-effort, never fatal)
+- Prints the exact webhook URL and secret to paste into GitHub
 
 Example output:
+
 ```
 →  Detected project type: node
 ✓  Deploy script created: /etc/pulld/deploy/my-app.sh
 ✓  Project 'my-app' registered
 ✓  Service reloaded
+✓  UPnP: port 9000 → 192.168.1.50:9000 (TCP) mapped on your router
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   GitHub Webhook Setup — my-app
@@ -97,54 +110,82 @@ Example output:
   3. Click Add webhook.
 ```
 
-Then edit the deploy script to match your exact setup:
+### Edit the deploy script
+
 ```bash
 nano /etc/pulld/deploy/my-app.sh
 ```
 
-Push a commit to trigger a test deploy:
+### Push a commit and watch it deploy
+
 ```bash
 pullctl logs my-app -f
 ```
 
 ---
 
-## CLI Reference
+## CLI reference
 
 | Command | Description |
 |---|---|
-| `pullctl add <name> --path <dir>` | Register a project |
-| `pullctl remove <name>` | Unregister a project |
-| `pullctl list` | List all projects and their status |
-| `pullctl logs <name> [-f]` | View (or follow) deploy logs |
+| `pullctl add <name> --path <dir> [--branch <branch>] [--timeout <sec>]` | Register a project |
+| `pullctl remove <name> [--keep-script] [--keep-logs]` | Unregister a project and clean up its files |
+| `pullctl list` | List all projects with status, last deploy time, and paths |
+| `pullctl logs <name> [-n <lines>] [-f]` | View or follow deploy logs |
 | `pullctl status` | Show the daemon's systemd status |
 | `pullctl secret <name>` | Print GitHub webhook setup instructions |
 | `pullctl secret <name> --regenerate` | Rotate the webhook secret |
-| `pullctl config --port <port>` | Change the listening port |
+| `pullctl config [--port <port>] [--host <host>]` | View or update global daemon settings |
 
-All commands that modify state require `sudo`.
+All commands that modify state require `sudo`. `pullctl logs` and `pullctl status` work without root.
+
+---
+
+## Deploy scripts
+
+A deploy script is a plain bash file. It runs as the pulld service user with the repo directory as its working directory. Both stdout and stderr are captured to the project's log file.
+
+The simplest possible deploy script:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+git pull
+npm ci --silent
+pm2 restart my-app
+```
+
+A few things to keep in mind:
+
+**`git pull` and credentials** — the repo must already be cloned. For SSH remotes, `pullctl add` generates a deploy key and configures SSH automatically — you just need to add the public key to GitHub. For HTTPS remotes, use a credential helper or a personal access token in the remote URL.
+
+**Restarting services** — by default the daemon runs as root, so `systemctl restart`, `docker compose`, etc. work out of the box from your deploy script.
+
+**Timeouts** — deploy scripts are killed after 300 seconds by default. Override per-project with `--timeout` when adding.
+
+**Failures** — if the script exits with a non-zero code, it's logged as a failed deploy. The previous version of the app continues running.
 
 ---
 
 ## File layout
 
 ```
-/usr/local/bin/pulld          # Daemon binary
-/usr/local/bin/pullctl        # CLI tool
-/etc/systemd/system/pulld.service
-/etc/pulld/config.json        # Project registry (chmod 600)
-/etc/pulld/deploy/<name>.sh   # Per-project deploy scripts
-/var/log/pulld/pulld.log   # Daemon log
-/var/log/pulld/<name>.log     # Per-project deploy logs
-/run/pulld/<name>.lock        # Per-project deploy locks
-/usr/share/pulld/templates/   # Starter deploy script templates
+/usr/local/bin/pulld              # Daemon
+/usr/local/bin/pullctl            # CLI tool
+/etc/systemd/system/pulld.service # Systemd unit
+/etc/pulld/config.json            # Project registry (chmod 600)
+/etc/pulld/deploy/<name>.sh       # Per-project deploy scripts
+/var/log/pulld/pulld.log          # Daemon log
+/var/log/pulld/<name>.log         # Per-project deploy logs
+/run/pulld/<name>.lock            # Per-project deploy locks (runtime)
+/usr/share/pulld/templates/       # Starter deploy script templates
 ```
 
 ---
 
-## Config format
+## Configuration
 
-`/etc/pulld/config.json` is managed by `pullctl`, but you can edit it directly if needed. The daemon re-reads it on every incoming request, so no restart is required.
+`/etc/pulld/config.json` is managed by `pullctl`, but you can edit it directly. The daemon re-reads it on every incoming request, so changes take effect immediately without a restart.
 
 ```json
 {
@@ -161,30 +202,7 @@ All commands that modify state require `sudo`.
 }
 ```
 
-Keys prefixed with `_` are global daemon settings. All other keys are project names.
-
----
-
-## Deploy scripts
-
-A deploy script is a plain bash file. It runs with the repo directory as its working directory. stdout and stderr are both captured to the project's log file.
-
-The simplest possible deploy script:
-```bash
-#!/bin/bash
-set -euo pipefail
-git pull
-npm ci --silent
-pm2 restart my-app
-```
-
-A few things to keep in mind:
-
-**`git pull` and credentials** — the repo must already be cloned and git credentials must be set up for the user the daemon runs as. For SSH repos, generate a key for that user and add it to GitHub. For HTTPS repos, use a credential helper or a personal access token in the remote URL.
-
-**Restarting systemd services from the script** — by default, the daemon runs as root (see the service file), so `systemctl restart` works out of the box.
-
-**Build failures** — if the deploy script exits with a non-zero code, it's logged and pulld reports it as a failed deploy. The previous version of the app continues running.
+Keys prefixed with `_` are global daemon settings. All other keys are project entries. Config writes are atomic (write to `.tmp`, then rename) to prevent corruption.
 
 ---
 
@@ -197,15 +215,25 @@ A few things to keep in mind:
 
 ---
 
-## Security notes
+## Security
 
 **HMAC validation** — every webhook payload is verified against the project's secret using `hmac.compare_digest`, which is constant-time and resistant to timing attacks. Requests with a missing or invalid signature are rejected with a 401.
 
-**Unknown projects** — requests for unregistered project names return a 200 (not 404) to avoid leaking information about which projects are configured.
+**Unknown projects** — requests to unregistered project names return 200 (not 404) to avoid leaking which projects are configured.
 
-**Config permissions** — `/etc/pulld/config.json` is written with `chmod 600` and contains webhook secrets in plaintext, which is standard practice for this type of tool (similar to how nginx or SSH configs store credentials). Protect access to the file accordingly.
+**Config permissions** — `/etc/pulld/config.json` is created with mode `600` and contains webhook secrets in plaintext, consistent with how tools like nginx and SSH store credentials. Protect access to this file accordingly.
 
-**Running as root** — the default service runs as root to keep deploy scripts simple (they can freely call `systemctl restart`, `docker`, etc.). If you prefer a dedicated user, change `User=` in the service file and ensure that user has the necessary permissions for your deploy scripts.
+**Systemd hardening** — the service unit sets `NoNewPrivileges=yes`, `PrivateTmp=yes`, and restricts write access to only the directories pulld needs (`/var/log/pulld`, `/run/pulld`, `/etc/pulld`).
+
+**Running as root** — the default service runs as root so deploy scripts can freely call `systemctl restart`, `docker compose`, etc. To use a dedicated user, change `User=` in the service file and ensure that user has the required permissions.
+
+---
+
+## Networking
+
+**UPnP port forwarding** — when you register a project, `pullctl` automatically attempts to configure a port mapping on your router via UPnP/IGD. This is best-effort — if your router doesn't support UPnP or it's disabled, you'll see a warning with instructions for manual port forwarding. This is only relevant for servers behind NAT (home labs, local machines). VPS and cloud servers don't need it.
+
+**Public IP detection** — `pullctl` resolves your server's public IP (via ipify, ifconfig.me, or icanhazip) to generate accurate webhook URLs. If public IP detection fails (e.g. no internet during setup), it falls back to the LAN IP and warns you to substitute it.
 
 ---
 
@@ -215,10 +243,10 @@ A few things to keep in mind:
 sudo bash uninstall.sh
 ```
 
-The uninstaller stops the service, removes the binaries and systemd unit, and asks before deleting config and logs.
+The uninstaller stops the service, removes the binaries and systemd unit, and prompts before deleting config and log directories.
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)
