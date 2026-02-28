@@ -429,6 +429,191 @@ def setup_upnp(port: int, project: str) -> bool:
         return False
 
 
+
+# ──────────────────────────────────────────────────────────────────
+# SSH deploy key management
+# ──────────────────────────────────────────────────────────────────
+
+ROOT_SSH_DIR  = "/root/.ssh"
+PULLD_KEY     = "/root/.ssh/id_ed25519_pulld"
+PULLD_KEY_PUB = "/root/.ssh/id_ed25519_pulld.pub"
+KNOWN_HOSTS   = "/root/.ssh/known_hosts"
+
+
+def _get_git_remote(repo_path: str) -> str:
+    """Return the configured git remote URL, or empty string."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _is_ssh_remote(remote: str) -> bool:
+    return remote.startswith("git@") or remote.startswith("ssh://")
+
+
+def _extract_ssh_host(remote: str) -> str:
+    """Extract hostname from git@github.com:user/repo or ssh://github.com/..."""
+    if remote.startswith("git@"):
+        return remote.split("@", 1)[1].split(":")[0]
+    if remote.startswith("ssh://"):
+        from urllib.parse import urlparse as _up
+        return _up(remote).hostname or ""
+    return ""
+
+
+def _ensure_deploy_key() -> str | None:
+    """
+    Ensure /root/.ssh/id_ed25519_pulld exists.
+    Generates it if missing. Returns the public key string, or None on failure.
+    """
+    os.makedirs(ROOT_SSH_DIR, mode=0o700, exist_ok=True)
+
+    if not os.path.exists(PULLD_KEY):
+        info("Generating SSH deploy key for pulld...")
+        try:
+            subprocess.run(
+                [
+                    "ssh-keygen", "-t", "ed25519",
+                    "-f", PULLD_KEY,
+                    "-N", "",                        # no passphrase
+                    "-C", "pulld-deploy-key",
+                ],
+                check=True, capture_output=True,
+            )
+            ok(f"Deploy key generated: {PULLD_KEY}")
+        except subprocess.CalledProcessError as e:
+            warn(f"ssh-keygen failed: {e.stderr.decode().strip()}")
+            return None
+
+    try:
+        return open(PULLD_KEY_PUB).read().strip()
+    except OSError:
+        return None
+
+
+def _add_to_known_hosts(host: str) -> None:
+    """
+    Run ssh-keyscan for the host and append results to /root/.ssh/known_hosts.
+    Skips if the host is already present.
+    """
+    os.makedirs(ROOT_SSH_DIR, mode=0o700, exist_ok=True)
+
+    # Check if host already in known_hosts
+    if os.path.exists(KNOWN_HOSTS):
+        existing = open(KNOWN_HOSTS).read()
+        if host in existing:
+            ok(f"{host} already in root known_hosts")
+            return
+
+    try:
+        result = subprocess.run(
+            ["ssh-keyscan", "-H", "-T", "5", host],
+            capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            with open(KNOWN_HOSTS, "a") as f:
+                f.write(result.stdout)
+            os.chmod(KNOWN_HOSTS, 0o600)
+            ok(f"Added {host} to root known_hosts")
+        else:
+            warn(f"ssh-keyscan returned nothing for {host} — you may need to add it manually")
+    except FileNotFoundError:
+        warn("ssh-keyscan not found — skipping known_hosts setup")
+
+
+def _configure_ssh_for_host(host: str) -> None:
+    """
+    Add an SSH config entry for the host so root always uses the pulld deploy key.
+    Idempotent — skips if the entry already exists.
+    """
+    ssh_config = os.path.join(ROOT_SSH_DIR, "config")
+    entry = f"Host {host}\n    IdentityFile {PULLD_KEY}\n    IdentitiesOnly yes\n"
+
+    existing = ""
+    if os.path.exists(ssh_config):
+        existing = open(ssh_config).read()
+
+    # Check for existing entry for this host
+    if f"Host {host}" in existing:
+        ok(f"SSH config entry for {host} already present")
+        return
+
+    with open(ssh_config, "a") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        f.write("\n" + entry)
+
+    os.chmod(ssh_config, 0o600)
+    ok(f"SSH config updated — using pulld deploy key for {host}")
+
+
+def setup_ssh_deploy_key(repo_path: str, project: str) -> None:
+    """
+    Full SSH setup for a project:
+      1. Detect if the remote uses SSH
+      2. Generate the pulld deploy key if missing
+      3. Add the remote host to known_hosts
+      4. Configure SSH to use the deploy key for that host
+      5. Print instructions to add the public key to GitHub
+    """
+    remote = _get_git_remote(repo_path)
+
+    if not remote:
+        warn("Could not detect git remote URL — skipping SSH setup")
+        return
+
+    if not _is_ssh_remote(remote):
+        # HTTPS remote — no SSH setup needed
+        return
+
+    host = _extract_ssh_host(remote)
+    if not host:
+        warn(f"Could not parse hostname from remote: {remote}")
+        return
+
+    info(f"SSH remote detected ({host}) — setting up deploy key...")
+
+    pub_key = _ensure_deploy_key()
+    if not pub_key:
+        warn("Could not generate deploy key — SSH setup incomplete")
+        return
+
+    _add_to_known_hosts(host)
+    _configure_ssh_for_host(host)
+
+    # Extract repo path from remote for the GitHub URL
+    # git@github.com:user/repo.git  →  user/repo
+    repo_slug = ""
+    if remote.startswith("git@"):
+        repo_slug = remote.split(":", 1)[-1].removesuffix(".git")
+
+    github_url = f"https://github.com/{repo_slug}/settings/keys/new" if repo_slug else ""
+
+    print(f"""
+{C.BOLD}{C.CYAN}{'━' * 64}{C.RESET}
+{C.BOLD}  GitHub Deploy Key Setup{C.RESET}
+{C.CYAN}{'━' * 64}{C.RESET}
+
+  pulld needs read access to your private repo.
+  Add the key below as a {C.BOLD}Deploy Key{C.RESET} on GitHub:
+
+  {f"{C.BOLD}Direct link:{C.RESET} {github_url}" if github_url else f"Go to: GitHub repo → Settings → Deploy keys → Add deploy key"}
+
+     {C.BOLD}Title{C.RESET}        pulld@{socket.gethostname()}
+     {C.BOLD}Key{C.RESET}          (paste the line below)
+     {C.BOLD}Allow write{C.RESET}  No (read-only is enough)
+
+  {C.YELLOW}{pub_key}{C.RESET}
+
+  After adding the key, push a commit to trigger a test deploy.
+{C.CYAN}{'━' * 64}{C.RESET}
+""")
+
 # ──────────────────────────────────────────────────────────────────
 # GitHub instructions printer
 # ──────────────────────────────────────────────────────────────────
@@ -558,6 +743,9 @@ def cmd_add(args):
         warn(f"Could not set git safe.directory: {e.stderr.decode().strip()}")
         warn(f"If deploys fail with 'dubious ownership', run manually:")
         warn(f"  sudo git config --global --add safe.directory {repo_path}")
+
+    # SSH deploy key setup — handles private repos over SSH
+    setup_ssh_deploy_key(repo_path, project)
 
     # Generate a cryptographically secure random secret
     secret = secrets.token_hex(32)
